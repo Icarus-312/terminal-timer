@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+"""timer - terminal countdown with an ASCII hourglass (cliamp-style theme)."""
+import curses
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+STATE_DIR = os.path.expanduser("~/.local/state/timer")
+USAGE = """usage:
+  timer <minutes>         start a countdown (decimals ok, e.g. 0.5)
+  timer start <minutes>   same as above
+  timer pause             pause running timer(s)
+  timer resume            resume paused timer(s)
+  timer cancel | stop     cancel all running timers"""
+
+FONT = {
+    "0": ["███", "█ █", "█ █", "█ █", "███"],
+    "1": [" █ ", "██ ", " █ ", " █ ", "███"],
+    "2": ["███", "  █", "███", "█  ", "███"],
+    "3": ["███", "  █", "███", "  █", "███"],
+    "4": ["█ █", "█ █", "███", "  █", "  █"],
+    "5": ["███", "█  ", "███", "  █", "███"],
+    "6": ["███", "█  ", "███", "█ █", "███"],
+    "7": ["███", "  █", "  █", "  █", "  █"],
+    "8": ["███", "█ █", "███", "█ █", "███"],
+    "9": ["███", "█ █", "███", "  █", "███"],
+    ":": ["   ", " █ ", "   ", " █ ", "   "],
+}
+
+# color pairs
+C_GLASS, C_SAND, C_TEXT, C_DIM, C_WARN, C_TITLE, C_CHIP, C_TOP, C_GHOST = 1, 2, 3, 4, 5, 6, 7, 8, 9
+
+
+# ---------- control commands ----------
+
+def live_timers():
+    """Return [(pid, path)] of running timers, removing stale state files."""
+    out = []
+    if not os.path.isdir(STATE_DIR):
+        return out
+    for name in os.listdir(STATE_DIR):
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(STATE_DIR, name)
+        try:
+            pid = int(name[:-5])
+            os.kill(pid, 0)
+        except (ValueError, ProcessLookupError):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            continue
+        except PermissionError:
+            pass
+        out.append((pid, path))
+    return out
+
+
+def control(action):
+    sigs = {"pause": signal.SIGUSR1, "resume": signal.SIGUSR2,
+            "cancel": signal.SIGTERM, "stop": signal.SIGTERM}
+    timers = live_timers()
+    if not timers:
+        print("no running timers")
+        return 1
+    for pid, _ in timers:
+        os.kill(pid, sigs[action])
+    verb = {"pause": "paused", "resume": "resumed",
+            "cancel": "cancelled", "stop": "cancelled"}[action]
+    n = len(timers)
+    print(f"{verb} {n} timer{'s' if n != 1 else ''}")
+    return 0
+
+
+# ---------- drawing helpers ----------
+
+def hourglass_geometry(rows):
+    h = max(3, min(11, (rows - 14) // 2))
+    return h, h - 1  # bulb height, max inner half-width (in cells)
+
+
+def half_widths(h, hw_max):
+    """Inner half-width per row of the top bulb (widest first, 0 at neck)."""
+    return [round(hw_max * (h - 1 - i) / (h - 1)) for i in range(h)]
+
+
+def fill_rows(hws, amount):
+    """Fill rows bottom-up with `amount` cells; returns [cells_filled] per row
+    (float for the topmost partial row)."""
+    res = [0.0] * len(hws)
+    for i in range(len(hws) - 1, -1, -1):
+        cap = 2 * hws[i] + 1
+        take = min(cap, amount)
+        res[i] = take
+        amount -= take
+        if amount <= 0:
+            break
+    return res
+
+
+def sand_cells(width_cells, filled):
+    """Return a list of chars (len width_cells) for `filled` centered cells."""
+    full = int(filled)
+    frac = filled - full
+    cells = [" "] * width_cells
+    if filled <= 0:
+        return cells
+    mid = width_cells // 2
+    order = [mid]
+    for d in range(1, width_cells):
+        if mid - d >= 0:
+            order.append(mid - d)
+        if mid + d < width_cells:
+            order.append(mid + d)
+    for k in range(min(full, width_cells)):
+        cells[order[k]] = "█"
+    if full < width_cells and frac > 0.05:
+        cells[order[full]] = "▓" if frac > 0.66 else "▒" if frac > 0.33 else "░"
+    return cells
+
+
+def put(win, y, x, s, attr=0):
+    h, w = win.getmaxyx()
+    if y < 0 or y >= h or x >= w:
+        return
+    if x < 0:
+        s, x = s[-x:], 0
+    s = s[: max(0, w - x - (1 if y == h - 1 else 0))]
+    if s:
+        try:
+            win.addstr(y, x, s, attr)
+        except curses.error:
+            pass
+
+
+def draw_hourglass(win, top, cx, h, hw_max, p, running, frame, paused):
+    glass = curses.color_pair(C_GLASS)
+    mod = curses.A_DIM if paused else 0
+    sand = curses.color_pair(C_SAND) | mod
+    topc = curses.color_pair(C_TOP) | mod
+    hws = half_widths(h, hw_max)
+    vol = sum(2 * w + 1 for w in hws)
+    top_fill = fill_rows(hws, vol * (1 - p))
+    bot_hws = hws[::-1]
+    bot_fill = fill_rows(bot_hws, vol * p)
+
+    cap_w = (2 * hw_max + 1) * 2 + 4
+    cap = "═" * cap_w
+    put(win, top, cx - cap_w // 2 - 1, "╔" + cap + "╗", glass | curses.A_BOLD)
+    # top bulb
+    for i in range(h):
+        y = top + 1 + i
+        wc = 2 * hws[i] + 1
+        left = cx - wc - 1
+        put(win, y, left, "╲", glass)
+        put(win, y, cx + wc, "╱", glass)
+        cells = sand_cells(wc, top_fill[i])
+        is_top = top_fill[i] > 0 and (i == 0 or top_fill[i - 1] <= 0)
+        put(win, y, left + 1, "".join(c * 2 for c in cells),
+            topc if is_top else sand)
+    # bottom bulb
+    surface = None
+    for j in range(h):
+        y = top + 1 + h + j
+        wc = 2 * bot_hws[j] + 1
+        left = cx - wc - 1
+        put(win, y, left, "╱", glass)
+        put(win, y, cx + wc, "╲", glass)
+        cells = sand_cells(wc, bot_fill[j])
+        if surface is None and bot_fill[j] > 0:
+            surface = j
+        put(win, y, left + 1, "".join(c * 2 for c in cells),
+            topc if surface == j else sand)
+    put(win, top + 1 + 2 * h, cx - cap_w // 2 - 1, "╚" + cap + "╝",
+        glass | curses.A_BOLD)
+
+    # falling stream through the neck into the bottom bulb
+    if running and 0 < p < 1 or (running and p == 0):
+        end = surface if surface is not None else h
+        for j in range(end):
+            ch = "│:.¦"[(j + frame) % 4]
+            put(win, top + 1 + h + j, cx - 1, ch * 2, sand)
+        if end > 0 or surface is None:
+            put(win, top + h, cx - 1, "██", sand)
+
+
+SEGS = {"0": "abcdef", "1": "bc", "2": "abdeg", "3": "abcdg", "4": "bcfg",
+        "5": "acdfg", "6": "acdefg", "7": "abc", "8": "abcdefg", "9": "abcdfg"}
+
+
+def clock_size(v):
+    """(width, height) of an MM:SS seven-segment clock with vertical len v."""
+    return 4 * 8 + 4, 2 * v + 3
+
+
+def draw_clock(win, y, cx, text, v, lit, ghost):
+    """Draw seven-segment digits; unlit segments stay visible as a dim ghost
+    so every digit keeps identical width and shape as the time changes."""
+    w, _ = clock_size(v)
+    x = cx - w // 2
+    for ch in text:
+        if ch == ":":
+            put(win, y + 1 + v // 2, x + 1, "██", lit)
+            put(win, y + 2 * v + 1 - v // 2, x + 1, "██", lit)
+            x += 4
+            continue
+        on = SEGS[ch]
+        def seg(name, row, col, glyph):
+            put(win, y + row, x + col, glyph, lit if name in on else ghost)
+        for name, row in (("a", 0), ("g", v + 1), ("d", 2 * v + 2)):
+            seg(name, row, 0, "███████")
+        for k in range(v):
+            for name, col, row in (("f", 0, 1 + k), ("b", 5, 1 + k),
+                                   ("e", 0, v + 2 + k), ("c", 5, v + 2 + k)):
+                seg(name, row, col, "██")
+        x += 8
+
+
+def fmt(sec):
+    sec = max(0, int(sec + 0.999))
+    return f"{sec // 60:02d}:{sec % 60:02d}"
+
+
+# ---------- start ----------
+
+def notify_done(minutes):
+    msg = f"{minutes:g} minute timer finished"
+    try:
+        if shutil.which("notify-send"):
+            cmd = ["notify-send", "-a", "timer", "Timer done", msg]
+        else:
+            cmd = ["osascript", "-e",
+                   f'display notification "{msg}" with title "Timer done"']
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+    if shutil.which("afplay"):
+        subprocess.Popen(["afplay", "/System/Library/Sounds/Glass.aiff"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return
+    sound = "/usr/share/sounds/freedesktop/stereo/complete.oga"
+    for player in ("paplay", "pw-play"):
+        if shutil.which(player) and os.path.exists(sound):
+            subprocess.Popen([player, sound], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+            return
+    sys.stdout.write("\a")
+
+
+def run_tui(stdscr, minutes, state_path):
+    duration = minutes * 60.0
+    curses.curs_set(0)
+    curses.start_color()
+    curses.use_default_colors()
+    # gruvbox: gold glass, olive sand with orange surface, cream text
+    if curses.COLORS >= 256:
+        pal = {C_GLASS: (172, -1), C_SAND: (107, -1), C_TEXT: (223, -1),
+               C_DIM: (245, -1), C_WARN: (208, -1), C_TITLE: (142, -1),
+               C_CHIP: (223, 239), C_TOP: (172, -1), C_GHOST: (236, -1)}
+    else:
+        pal = {C_GLASS: (curses.COLOR_YELLOW, -1), C_SAND: (curses.COLOR_GREEN, -1),
+               C_TEXT: (curses.COLOR_WHITE, -1), C_DIM: (curses.COLOR_WHITE, -1),
+               C_WARN: (curses.COLOR_RED, -1), C_TITLE: (curses.COLOR_GREEN, -1),
+               C_CHIP: (curses.COLOR_WHITE, curses.COLOR_BLACK),
+               C_TOP: (curses.COLOR_YELLOW, -1),
+               C_GHOST: (curses.COLOR_BLACK, -1)}
+    for k, (fg, bg) in pal.items():
+        curses.init_pair(k, fg, bg)
+    stdscr.timeout(100)
+
+    flags = {"paused": False, "cancel": False}
+    signal.signal(signal.SIGUSR1, lambda *_: flags.update(paused=True))
+    signal.signal(signal.SIGUSR2, lambda *_: flags.update(paused=False))
+    signal.signal(signal.SIGTERM, lambda *_: flags.update(cancel=True))
+
+    elapsed = 0.0
+    last = time.monotonic()
+    frame = 0
+    done = False
+
+    def save():
+        try:
+            with open(state_path, "w") as f:
+                json.dump({"pid": os.getpid(), "duration": duration,
+                           "elapsed": elapsed, "paused": flags["paused"]}, f)
+        except OSError:
+            pass
+
+    save()
+    last_paused = False
+    while not flags["cancel"]:
+        now = time.monotonic()
+        if not flags["paused"] and not done:
+            elapsed += now - last
+        last = now
+        if flags["paused"] != last_paused:
+            last_paused = flags["paused"]
+            save()
+        if elapsed >= duration and not done:
+            done = True
+            elapsed = duration
+            notify_done(minutes)
+
+        p = min(1.0, elapsed / duration)
+        rows, cols = stdscr.getmaxyx()
+        stdscr.erase()
+        glass = curses.color_pair(C_GLASS)
+        text = curses.color_pair(C_TEXT)
+        dim = curses.color_pair(C_DIM)
+
+        title = curses.color_pair(C_TITLE) | curses.A_BOLD
+        cream = text
+        mins = f"{minutes:g}"
+        put(stdscr, 1, 1, "T I M E R", title)
+        put(stdscr, 2, 1, f"⏳ {mins} min focus", curses.color_pair(C_WARN))
+        put(stdscr, 3, 1, f"{fmt(elapsed)} / {fmt(duration)}", cream)
+        if done:
+            status = "✔ Done"
+        elif flags["paused"]:
+            status = "❚❚ Paused"
+        else:
+            status = "▶ Running"
+        put(stdscr, 3, cols - len(status) - 2, status, cream)
+        cx = cols // 2
+
+        h, hw_max = hourglass_geometry(rows)
+        gh = 2 * h + 2
+        big = rows >= gh + 14
+        top = 5
+        if rows >= gh + 9 and cols >= (2 * hw_max + 1) * 2 + 8:
+            draw_hourglass(stdscr, top, cx, h, hw_max, p,
+                           not flags["paused"] and not done, frame,
+                           flags["paused"])
+        y = top + gh + 1
+        remaining = duration - elapsed
+        if big:
+            v = 2 if rows >= gh + 16 else 1
+            draw_clock(stdscr, y, cx, fmt(remaining), v,
+                       curses.color_pair(C_TEXT) | curses.A_BOLD,
+                       curses.color_pair(C_GHOST))
+            y += clock_size(v)[1] + 1
+        else:
+            s = fmt(remaining)
+            put(stdscr, y, cx - len(s) // 2, s, text | curses.A_BOLD)
+            y += 1
+        # cliamp-style seek line with a marker
+        gold = curses.color_pair(C_GLASS)
+        put(stdscr, y, 1, "─" * (cols - 2), gold)
+        put(stdscr, y, 1 + int((cols - 3) * p), "●", gold | curses.A_BOLD)
+        # footer key chips
+        chip = curses.color_pair(C_CHIP)
+        x = 1
+        keys = [(" Space ", "Pause / Resume"), (" q ", "Cancel")]
+        if done:
+            keys = [(" any key ", "Close")]
+        for k, label in keys:
+            put(stdscr, rows - 2, x, k, chip)
+            put(stdscr, rows - 2, x + len(k) + 1, label, dim)
+            x += len(k) + len(label) + 3
+        stdscr.refresh()
+        frame += 1
+
+        ch = stdscr.getch()
+        if done and ch != -1:
+            return "done"
+        if ch in (ord("q"), ord("Q"), 27, 3):
+            flags["cancel"] = True
+        elif ch == ord(" ") and not done:
+            flags["paused"] = not flags["paused"]
+        if done and elapsed >= duration and time.monotonic() - now > 600:
+            return "done"
+    return "cancelled"
+
+
+def start(arg):
+    try:
+        minutes = float(arg)
+        if minutes <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        print("timer start: need a positive number of minutes\n" + USAGE)
+        return 2
+    os.makedirs(STATE_DIR, exist_ok=True)
+    state_path = os.path.join(STATE_DIR, f"{os.getpid()}.json")
+    try:
+        result = curses.wrapper(run_tui, minutes, state_path)
+    except KeyboardInterrupt:
+        result = "cancelled"
+    finally:
+        try:
+            os.remove(state_path)
+        except OSError:
+            pass
+    print("timer done" if result == "done" else "timer cancelled")
+    return 0
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] in ("-h", "--help", "help"):
+        print(USAGE)
+        return 0
+    cmd = argv[1]
+    if cmd == "start":
+        return start(argv[2] if len(argv) > 2 else None)
+    try:
+        float(cmd)
+    except ValueError:
+        pass
+    else:
+        return start(cmd)
+    if cmd in ("pause", "resume", "cancel", "stop"):
+        return control(cmd)
+    print(f"unknown command: {cmd}\n" + USAGE)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

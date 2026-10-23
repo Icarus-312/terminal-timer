@@ -1,0 +1,5 @@
+# runtime state lives in ~/.local/state/timer, outside the repo; ignore strays
+*.json
+# python bytecode
+__pycache__/
+*.pyc
